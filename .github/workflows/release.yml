@@ -1,0 +1,61 @@
+name: Release installers
+
+# Push a tag such as v0.1.0 (or run this from the Actions tab) and GitHub builds
+# the Windows (.exe/.msi), macOS (.dmg, Intel + Apple Silicon) and Linux
+# (.deb/.rpm/.AppImage) installers and attaches them to one release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: Windows x64, os: windows-latest, args: "" }
+          - { label: macOS Intel + Apple Silicon, os: macos-latest, args: "--target universal-apple-darwin" }
+          - { label: Linux x64, os: ubuntu-22.04, args: "" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev pkg-config libxcb1-dev libxrandr-dev libdbus-1-dev \
+            libpipewire-0.3-dev libclang-dev libgbm-dev rpm
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "SnapPro ${{ github.ref_name }}"
+          releaseBody: "Download the file for your system: Windows (.exe), macOS (.dmg), Linux (.deb / .rpm / .AppImage)."
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

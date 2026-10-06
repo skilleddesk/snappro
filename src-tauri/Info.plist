@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>SnapPro needs screen access to take screenshots and record your screen.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>SnapPro can show your webcam in a corner of a screen recording.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>SnapPro can record your voice together with a screen recording.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>SnapPro uses Finder to show captured files.</string>
+</dict>
+</plist>
