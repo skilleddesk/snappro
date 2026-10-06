@@ -60,7 +60,9 @@ body,
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  background: radial-gradient(ellipse 100% 0% at 50% 0%, rgba(139, 92, 246, 0.15), transparent 70%);
+  /* 1px, not 0%: WebKitGTK (Linux) paints a zero-height radial gradient as solid
+     black over the whole panel, while WebView2 paints it transparent. */
+  background: radial-gradient(ellipse 100% 1px at 50% 0%, rgba(139, 92, 246, 0.15), transparent 70%);
   pointer-events: none;
 }
 

@@ -190,6 +190,9 @@ export function RecorderSetup() {
     }
   };
 
+  // On Wayland the desktop asks which screen or window to share when the take
+  // starts (one at a time), and the window list only shows XWayland windows.
+  const desktopAsks = Boolean(dependencies?.wayland);
   const monitorIndex = settings.recordingMonitor ?? monitors.findIndex((m) => m.primary);
   const ffmpegMissing = dependencies !== null && !dependencies.ffmpeg;
 
@@ -200,17 +203,19 @@ export function RecorderSetup() {
       : mode === "window"
         ? picked
           ? `Window: ${picked.title}`
-          : "Window: not chosen yet"
+          : desktopAsks
+            ? "Window: chosen when recording starts"
+            : "Window: not chosen yet"
         : region
           ? `Area ${region.width}×${region.height} at ${region.x},${region.y}`
           : "Area: not chosen yet";
-  const ready = mode === "screen" || (mode === "window" && Boolean(picked)) || (mode === "custom" && Boolean(region));
+  const ready = mode === "screen" || (mode === "window" && (Boolean(picked) || desktopAsks)) || (mode === "custom" && Boolean(region));
 
   const start = async () => {
     setBusy(true);
     try {
       const overrides: Partial<api.RecordOptions> = { mode };
-      if (mode === "window" && picked) {
+      if (mode === "window" && picked && !desktopAsks) {
         // Re-read the position: the window may have been moved since it was picked.
         const bounds = await api.windowBounds(picked.id).catch(() => picked);
         overrides.region = { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
@@ -289,7 +294,12 @@ export function RecorderSetup() {
                 </div>
               </button>
             ))}
-            {monitors.length > 1 && allBounds ? (
+            {desktopAsks ? (
+              <div className="text-[10px] leading-relaxed text-slate-400 px-1">
+                The first time, your desktop asks which screen to share: pick the same one there.
+              </div>
+            ) : null}
+            {monitors.length > 1 && allBounds && !desktopAsks ? (
               <button
                 onClick={() => set({ recordingMode: "custom", recordingRegion: allBounds })}
                 className="w-full text-left rounded-xl border border-dashed border-white/15 px-2.5 py-2 text-[10.5px] text-slate-400 hover:text-slate-200 hover:border-white/30"
@@ -300,7 +310,11 @@ export function RecorderSetup() {
           </div>
         ) : null}
 
-        {mode === "window" ? (
+        {mode === "window" && desktopAsks ? (
+          <div className="text-[10px] leading-relaxed text-slate-400 px-1">
+            Press Start: your desktop asks which window to share. Tick “Remember this selection” there and it will not ask again.
+          </div>
+        ) : mode === "window" ? (
           <>
             <div className="flex gap-1.5">
               <button className="ghost-btn flex-1 !text-[10.5px]" onClick={() => void startOverlay("recwindow")}>

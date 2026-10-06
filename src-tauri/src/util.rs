@@ -19,7 +19,22 @@ pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
     }
     cmd.stdin(Stdio::null());
+    restore_child_environment(&mut cmd);
     cmd
+}
+
+/// SnapPro forces its own windows onto XWayland (see main.rs); programs it starts,
+/// such as the file manager or an image viewer, get the session's setting back.
+pub fn restore_child_environment(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    if let Ok(original) = std::env::var("SNAPPRO_GDK_BACKEND_ORIG") {
+        if original.is_empty() {
+            cmd.env_remove("GDK_BACKEND");
+        } else {
+            cmd.env("GDK_BACKEND", original);
+        }
+    }
+    let _ = cmd;
 }
 
 /// Root folder where SnapPro stores captures: `<Pictures>/SnapPro`

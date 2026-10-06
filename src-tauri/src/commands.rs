@@ -987,6 +987,7 @@ pub async fn stop_recording(
         .await
         .map_err(|e| e.to_string())?;
     }
+    crate::recorder::end_screen_session();
 
     let segments = {
         let mut inner = state.inner.lock().unwrap();
@@ -1284,10 +1285,24 @@ pub fn library_reveal(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
-    use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_path(path, None::<&str>)
-        .map_err(|e| e.to_string())
+    // Linux: through xdg-open, so the viewer starts with the session's own GDK
+    // backend instead of SnapPro's XWayland one.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = &app;
+        crate::util::hidden_command("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .open_path(path, None::<&str>)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[tauri::command]
@@ -1598,7 +1613,16 @@ pub fn check_dependencies() -> serde_json::Value {
         "arch": std::env::consts::ARCH,
         "appVersion": env!("CARGO_PKG_VERSION"),
         "recordingBlocker": crate::recorder::session_blocker(),
+        // Wayland: the desktop asks which screen / window to share when a take starts.
+        "wayland": cfg!(target_os = "linux") && is_wayland_session(),
     })
+}
+
+fn is_wayland_session() -> bool {
+    #[cfg(target_os = "linux")]
+    return crate::portal::is_wayland();
+    #[cfg(not(target_os = "linux"))]
+    return false;
 }
 
 /// Report how many pixels the virtual desktop covers — shown in Settings.
@@ -1636,6 +1660,34 @@ pub async fn copy_image_file(app: AppHandle, path: String) -> Result<(), String>
 // ---------------------------------------------------------------------------
 // Hotkey / tray actions shared with the UI
 // ---------------------------------------------------------------------------
+
+/// Action of a command line such as `snappro --capture region` or `snappro --record`,
+/// as a `hotkey_action` index. A second launch hands its arguments to the running
+/// copy, so desktop keyboard shortcuts can drive SnapPro where an app cannot grab
+/// global shortcuts itself (Wayland).
+pub fn cli_action(args: &[String]) -> Option<usize> {
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--record" => return Some(4),
+            "--capture" => {
+                return match iter.next().map(|s| s.as_str()).unwrap_or("full") {
+                    "full" => Some(0),
+                    "window" => Some(1),
+                    "region" => Some(2),
+                    "scrolling" => Some(3),
+                    "all" => Some(5),
+                    "text" => Some(6),
+                    "fixed" => Some(7),
+                    "color" => Some(8),
+                    _ => None,
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 pub fn hotkey_action(app: AppHandle, index: usize) {
     let handle = app.clone();
@@ -1941,6 +1993,16 @@ pub fn open_url(app: AppHandle, url: String) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("only web links can be opened".into());
     }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = &app;
+        return crate::util::hidden_command("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
+    #[allow(unreachable_code)]
     app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 
@@ -2068,6 +2130,7 @@ pub fn shutdown_recording(app: &AppHandle) {
     if let Some(mut child) = child {
         let _ = crate::recorder::stop_child(&mut child);
     }
+    crate::recorder::end_screen_session();
     let segments: Vec<PathBuf> = segments.into_iter().filter(|s| s.exists()).collect();
     if let (Some(output), false) = (output, segments.is_empty()) {
         let segments = crate::recorder::compose_cameras(&segments, &options);

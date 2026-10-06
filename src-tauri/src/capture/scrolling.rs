@@ -295,7 +295,7 @@ pub fn capture_scrolling(
         anyhow::anyhow!(
             "Scrolling capture needs permission to control the mouse wheel ({e}). \
              On macOS allow SnapPro under Privacy & Security > Accessibility; \
-             on Linux use an X11 session."
+             on Linux allow remote interaction when the desktop asks."
         )
     })?;
     let max_frames = max_frames.clamp(2, 120);

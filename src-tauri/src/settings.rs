@@ -190,6 +190,12 @@ pub fn apply_shortcuts(app: &AppHandle, settings: &Settings) -> Vec<String> {
         .collect();
     entries.push((settings.shortcut_ocr.clone(), 6));
 
+    // GNOME on Wayland: the desktop itself has to run the shortcuts.
+    #[cfg(target_os = "linux")]
+    if crate::gnome_shortcuts::wanted() {
+        crate::gnome_shortcuts::apply(entries.clone());
+    }
+
     for (accel, action) in entries {
         if accel.trim().is_empty() {
             continue;

@@ -4,25 +4,53 @@ name: Release installers
 # the Windows (.exe/.msi), macOS (.dmg, Intel + Apple Silicon) and Linux
 # (.deb/.rpm/.AppImage) installers and attaches them to one release.
 
+#
+# From the Actions tab one system can be built alone (for example a Linux-only
+# fix): choose it under "platforms" and give the release tag, e.g. v0.1.1.
+
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Which installers to build"
+        type: choice
+        options: [all, linux, windows, macos]
+        default: all
+      tag:
+        description: "Release tag to create or add to, e.g. v0.1.1"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        env:
+          WANTED: ${{ inputs.platforms || 'all' }}
+        run: |
+          all='[
+            {"platform":"windows","label":"Windows x64","os":"windows-latest","args":""},
+            {"platform":"macos","label":"macOS Intel + Apple Silicon","os":"macos-latest","args":"--target universal-apple-darwin"},
+            {"platform":"linux","label":"Linux x64","os":"ubuntu-24.04","args":""}
+          ]'
+          echo "matrix=$(echo "$all" | jq -c --arg w "$WANTED" '[.[] | select($w == "all" or .platform == $w)]')" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.label }}
+    needs: plan
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { label: Windows x64, os: windows-latest, args: "" }
-          - { label: macOS Intel + Apple Silicon, os: macos-latest, args: "--target universal-apple-darwin" }
-          - { label: Linux x64, os: ubuntu-24.04, args: "" }
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -53,8 +81,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "SnapPro ${{ github.ref_name }}"
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: "SnapPro ${{ inputs.tag || github.ref_name }}"
           releaseBody: "Download the file for your system: Windows (.exe), macOS (.dmg), Linux (.deb / .rpm / .AppImage)."
           releaseDraft: false
           prerelease: false

@@ -822,3 +822,107 @@ fn every_take_keeps_an_audio_track_so_sound_can_be_switched_midway() {
     let gif = build_args(&RecordOptions { format: "gif".into(), ..RecordOptions::default() }, "out.mkv").join(" ");
     assert!(!gif.contains("anullsrc"), "gif has no sound");
 }
+
+// ---------------------------------------------------------------------------
+// Linux / Wayland
+// ---------------------------------------------------------------------------
+
+#[test]
+fn crop_desktop_cuts_and_scales_from_the_portal_picture() {
+    use snappro_lib::capture::full::crop_desktop;
+    // Desktop 200x100 at the origin; the picture is twice as large (HiDPI).
+    let picture = with_band(solid(400, 200, [10, 10, 10, 255]), 100, 200, [200, 0, 0, 255]);
+    let piece = crop_desktop(&picture, (0, 0, 200, 100), (50, 50, 20, 10)).unwrap();
+    assert_eq!((piece.width(), piece.height()), (40, 20));
+    assert_eq!(piece.get_pixel(0, 0).0, [200, 0, 0, 255]);
+    // A desktop whose left edge is negative (monitor left of the primary one).
+    let picture = solid(300, 100, [1, 2, 3, 255]);
+    let piece = crop_desktop(&picture, (-100, 0, 300, 100), (-100, 0, 300, 100)).unwrap();
+    assert_eq!((piece.width(), piece.height()), (300, 100));
+    // Partly off screen keeps the requested size.
+    let piece = crop_desktop(&picture, (0, 0, 300, 100), (290, 90, 20, 20)).unwrap();
+    assert_eq!((piece.width(), piece.height()), (20, 20));
+    assert!(crop_desktop(&picture, (0, 0, 300, 100), (400, 400, 10, 10)).is_err());
+}
+
+#[test]
+fn cli_actions_map_to_hotkey_actions() {
+    use snappro_lib::commands::cli_action;
+    let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(cli_action(&args(&["snappro"])), None);
+    assert_eq!(cli_action(&args(&["snappro", "--capture"])), Some(0));
+    assert_eq!(cli_action(&args(&["snappro", "--capture", "region"])), Some(2));
+    assert_eq!(cli_action(&args(&["snappro", "--capture", "window"])), Some(1));
+    assert_eq!(cli_action(&args(&["snappro", "--capture", "color"])), Some(8));
+    assert_eq!(cli_action(&args(&["snappro", "--record"])), Some(4));
+    assert_eq!(cli_action(&args(&["snappro", "--capture", "nonsense"])), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gnome_shortcuts_use_gtk_notation() {
+    use snappro_lib::gnome_shortcuts::{cli_argument, gtk_accelerator, parse_paths};
+    assert_eq!(gtk_accelerator("CmdOrCtrl+Shift+2").as_deref(), Some("<Control><Shift>2"));
+    assert_eq!(gtk_accelerator("Alt+PrintScreen").as_deref(), Some("<Alt>Print"));
+    assert_eq!(gtk_accelerator("Shift+Super+S").as_deref(), Some("<Shift><Super>s"));
+    assert_eq!(gtk_accelerator("Ctrl+F12").as_deref(), Some("<Control>F12"));
+    assert_eq!(gtk_accelerator("Ctrl+Shift+KeyO").as_deref(), Some("<Control><Shift>o"));
+    assert_eq!(gtk_accelerator("Ctrl+A+B"), None);
+    assert_eq!(gtk_accelerator(""), None);
+    use snappro_lib::gnome_shortcuts::{gvariant_string, shortcut_command};
+    assert_eq!(gvariant_string("SnapPro: it's"), "'SnapPro: it\\'s'");
+    assert_eq!(shortcut_command("/usr/bin/snappro", "--capture region"), "/usr/bin/snappro --capture region");
+    assert_eq!(shortcut_command("/opt/Snap Pro/snappro", "--record"), "\"/opt/Snap Pro/snappro\" --record");
+    assert_eq!(parse_paths("@as []"), Vec::<String>::new());
+    assert_eq!(parse_paths("['/a/', '/b/']"), vec!["/a/".to_string(), "/b/".to_string()]);
+    for action in 0..=8 {
+        let arg = cli_argument(action).unwrap();
+        let mut argv = vec!["snappro".to_string()];
+        argv.extend(arg.split(' ').map(str::to_string));
+        assert_eq!(snappro_lib::commands::cli_action(&argv), Some(action));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn portal_file_uri_is_decoded() {
+    use snappro_lib::portal::uri_to_path;
+    assert_eq!(
+        uri_to_path("file:///home/a/Pictures/Screenshot%20from%202026.png").unwrap(),
+        std::path::PathBuf::from("/home/a/Pictures/Screenshot from 2026.png")
+    );
+    assert!(uri_to_path("https://example.com/x.png").is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn wayland_recording_reads_the_picture_from_stdin() {
+    use snappro_lib::recorder::{build_args_for, wayland, RecordOptions, RegionRect, ScreenSource};
+    let region = RegionRect { x: 100, y: 50, width: 640, height: 360 };
+    // The shared screen is 1920x1080 at the origin; the stream may have more pixels.
+    let crop = wayland::crop_filter(&region, Some((0, 0)), Some((1920, 1080))).unwrap();
+    assert_eq!(crop, "crop=trunc(iw*640/1920):trunc(ih*360/1080):trunc(iw*100/1920):trunc(ih*50/1080)");
+    // A region that is the whole screen needs no crop.
+    let whole = RegionRect { x: 0, y: 0, width: 1920, height: 1080 };
+    assert_eq!(wayland::crop_filter(&whole, Some((0, 0)), Some((1920, 1080))), None);
+    // Second screen: the region is made relative to it.
+    let right = RegionRect { x: 2020, y: 0, width: 100, height: 100 };
+    let crop = wayland::crop_filter(&right, Some((1920, 0)), Some((1280, 1024))).unwrap();
+    assert!(crop.ends_with("trunc(iw*100/1280):trunc(ih*0/1024)"), "{crop}");
+
+    let opts = RecordOptions { region: Some(region), mode: "custom".into(), ..RecordOptions::default() };
+    let args = build_args_for(&opts, "out.mkv", &ScreenSource::Pipe(Some(crop.clone())));
+    let joined = args.join(" ");
+    assert!(joined.contains("-f yuv4mpegpipe -i pipe:0"), "{joined}");
+    assert!(!joined.contains("x11grab"), "{joined}");
+    assert!(joined.contains(&crop), "{joined}");
+    // The sound inputs never end, so the segment must end with the picture.
+    assert!(args.contains(&"-shortest".to_string()));
+    // The normal X11 grabber is untouched.
+    let grab = snappro_lib::recorder::build_args(&opts, "out.mkv").join(" ");
+    assert!(grab.contains("x11grab") && !grab.contains("-shortest"), "{grab}");
+
+    let gst = wayland::gst_args(42, 30).join(" ");
+    assert!(gst.contains("pipewiresrc fd=3 path=42"), "{gst}");
+    assert!(gst.contains("framerate=30/1") && gst.contains("y4menc"), "{gst}");
+}

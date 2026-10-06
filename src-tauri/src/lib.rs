@@ -6,11 +6,15 @@ pub mod clipboard;
 pub mod cloud;
 pub mod commands;
 pub mod feedback;
+#[cfg(target_os = "linux")]
+pub mod gnome_shortcuts;
 pub mod history;
 pub mod imageio;
 pub mod ocr;
 pub mod pdf;
 pub mod plugins;
+#[cfg(target_os = "linux")]
+pub mod portal;
 pub mod recorder;
 pub mod settings;
 pub mod shell_open;
@@ -27,8 +31,11 @@ pub fn run() {
     // fight over the global shortcuts and show two tray icons.
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            commands::focus_main(app);
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            match commands::cli_action(&args) {
+                Some(action) => commands::hotkey_action(app.clone(), action),
+                None => commands::focus_main(app),
+            }
         }));
     }
     builder
@@ -58,6 +65,11 @@ pub fn run() {
             let _ = settings::apply_shortcuts(&handle, &settings::load(&handle));
 
             build_tray(app)?;
+
+            let args: Vec<String> = std::env::args().collect();
+            if let Some(action) = commands::cli_action(&args) {
+                commands::hotkey_action(app.handle().clone(), action);
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

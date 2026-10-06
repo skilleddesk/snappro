@@ -1,6 +1,5 @@
 use image::RgbaImage;
 
-use crate::capture::r;
 
 /// Full-screen snapshot used as the backdrop of the region selector overlay.
 ///
@@ -14,7 +13,7 @@ pub fn overlay_backdrop(monitor: Option<usize>) -> anyhow::Result<(RgbaImage, St
         return Ok((image, "all displays".to_string(), vx, vy, w, h));
     }
     let m = crate::capture::full::select_monitor(monitor)?;
-    let image = r(m.capture_image())?;
+    let image = crate::capture::full::monitor_image(&m)?;
     let (w, h) = (image.width(), image.height());
     Ok((
         image,

@@ -232,6 +232,8 @@ export interface DependencyReport {
   appVersion?: string;
   /** Why recording cannot work in this session (for example Wayland), if it cannot. */
   recordingBlocker?: string | null;
+  /** Linux Wayland session: the desktop itself asks which screen or window to share. */
+  wayland?: boolean;
 }
 
 export interface SavedImage {

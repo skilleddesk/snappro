@@ -92,7 +92,7 @@ pub fn capture_all_monitors(format: &str, dir: PathBuf) -> anyhow::Result<Captur
 /// Capture the whole screen of the selected monitor and store it as an image file.
 pub fn capture_full_screen(index: Option<usize>, format: &str, dir: PathBuf) -> anyhow::Result<CaptureResult> {
     let monitor = select_monitor(index)?;
-    let image: RgbaImage = r(monitor.capture_image())?;
+    let image: RgbaImage = monitor_image(&monitor)?;
     let (id, path, size, width, height) = store_image(&image, &dir, "Screen", format)?;
     Ok(CaptureResult::new(
         id,
@@ -144,6 +144,9 @@ pub fn capture_rect_raw(x: i32, y: i32, width: u32, height: u32) -> anyhow::Resu
     if width == 0 || height == 0 {
         anyhow::bail!("selected region is empty");
     }
+    if let Some(image) = portal_rect((x, y, width, height))? {
+        return Ok(image);
+    }
     let monitors = r(Monitor::all())?;
     let mut canvas = RgbaImage::new(width, height);
     let mut any = false;
@@ -193,6 +196,10 @@ pub fn capture_region_raw(x: i32, y: i32, width: u32, height: u32) -> anyhow::Re
 
 /// Small helper used by the colour picker: capture a 1x1 pixel at a global point.
 pub fn pixel_at(x: i32, y: i32) -> anyhow::Result<(u8, u8, u8, u8)> {
+    if let Some(image) = portal_rect((x, y, 1, 1))? {
+        let c = image.get_pixel(0, 0).0;
+        return Ok((c[0], c[1], c[2], c[3]));
+    }
     let monitor = monitor_at(x, y, None)?;
     let rx = (x - monitor.x().unwrap_or(0)).max(0) as u32;
     let ry = (y - monitor.y().unwrap_or(0)).max(0) as u32;
@@ -200,6 +207,77 @@ pub fn pixel_at(x: i32, y: i32) -> anyhow::Result<(u8, u8, u8, u8)> {
     let px = image.get_pixel(0, 0);
     let c = px.0;
     Ok((c[0], c[1], c[2], c[3]))
+}
+
+/// The whole picture of one monitor.
+pub fn monitor_image(monitor: &Monitor) -> anyhow::Result<RgbaImage> {
+    let rect = (
+        monitor.x().unwrap_or(0),
+        monitor.y().unwrap_or(0),
+        monitor.width().unwrap_or(0),
+        monitor.height().unwrap_or(0),
+    );
+    if let Some(image) = portal_rect(rect)? {
+        return Ok(image);
+    }
+    r(monitor.capture_image())
+}
+
+/// Wayland: programs may not read the screen, so one picture of the whole
+/// desktop is asked from the desktop portal and `rect` is cut out of it.
+/// (xcap asks the portal once per monitor and ignores the monitor's offset,
+/// which put the wrong part of the desktop into multi-monitor shots.)
+/// `None` everywhere else.
+#[cfg(target_os = "linux")]
+fn portal_rect(rect: (i32, i32, u32, u32)) -> anyhow::Result<Option<RgbaImage>> {
+    if !crate::portal::is_wayland() {
+        return Ok(None);
+    }
+    let desktop = virtual_bounds()?;
+    let picture = crate::portal::screenshot(false)?;
+    crop_desktop(&picture, desktop, rect).map(Some)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn portal_rect(_rect: (i32, i32, u32, u32)) -> anyhow::Result<Option<RgbaImage>> {
+    Ok(None)
+}
+
+/// Cut `rect` (virtual desktop coordinates) out of `picture`, a picture of the
+/// whole `desktop` rectangle. The picture may have more pixels than the layout
+/// (HiDPI); the result keeps that full resolution.
+pub fn crop_desktop(
+    picture: &RgbaImage,
+    desktop: (i32, i32, u32, u32),
+    rect: (i32, i32, u32, u32),
+) -> anyhow::Result<RgbaImage> {
+    let (dx, dy, dw, dh) = desktop;
+    if dw == 0 || dh == 0 || picture.width() == 0 || picture.height() == 0 {
+        anyhow::bail!("display size is unknown");
+    }
+    let Some((ix, iy, iw, ih)) = intersect_rect(rect, desktop) else {
+        anyhow::bail!("selected region is outside the display");
+    };
+    let sx = picture.width() as f64 / dw as f64;
+    let sy = picture.height() as f64 / dh as f64;
+    let scale = |v: f64, s: f64| (v * s).round().max(0.0) as u32;
+    let px = scale((ix - dx) as f64, sx).min(picture.width() - 1);
+    let py = scale((iy - dy) as f64, sy).min(picture.height() - 1);
+    let pw = scale(iw as f64, sx).clamp(1, picture.width() - px);
+    let ph = scale(ih as f64, sy).clamp(1, picture.height() - py);
+    let piece = image::imageops::crop_imm(picture, px, py, pw, ph).to_image();
+    if (ix, iy, iw, ih) == rect {
+        return Ok(piece);
+    }
+    // Partly off screen: keep the requested size, the missing part stays transparent.
+    let mut canvas = RgbaImage::new(scale(rect.2 as f64, sx).max(1), scale(rect.3 as f64, sy).max(1));
+    image::imageops::overlay(
+        &mut canvas,
+        &piece,
+        scale((ix - rect.0) as f64, sx) as i64,
+        scale((iy - rect.1) as f64, sy) as i64,
+    );
+    Ok(canvas)
 }
 
 pub fn temp_png_name() -> String {

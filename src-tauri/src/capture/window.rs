@@ -64,6 +64,14 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
 
 /// Capture the currently focused window (falls back to the largest visible window).
 pub fn capture_active_window(format: &str, dir: PathBuf, window_id: Option<u32>) -> anyhow::Result<CaptureResult> {
+    // Wayland hides other programs' windows from SnapPro (only XWayland ones are
+    // listed), so "the focused window" would be a wrong guess: the desktop's own
+    // screenshot dialog lets the person click the window instead.
+    #[cfg(target_os = "linux")]
+    if window_id.is_none() && crate::portal::is_wayland() {
+        let image = crate::portal::screenshot(true)?;
+        return crate::capture::full::save_rgba(image, "Window", format, dir, "window", "window".into());
+    }
     let windows = r(Window::all())?;
     let mut candidates: Vec<_> = windows
         .into_iter()

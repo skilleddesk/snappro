@@ -1,6 +1,6 @@
 [package]
 name = "snappro"
-version = "0.1.0"
+version = "0.1.1"
 description = "SnapPro — Screenshot, Editor & Screen Recorder"
 authors = ["SnapPro"]
 edition = "2021"
@@ -40,6 +40,12 @@ hex = "0.4"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
+
+# Wayland: screenshots and screen recording go through the XDG desktop portal.
+# Both crates are already in the tree through xcap / tauri.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+libc = "0.2"
 
 [profile.release]
 codegen-units = 1

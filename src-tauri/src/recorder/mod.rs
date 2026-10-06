@@ -4,6 +4,9 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
+pub mod wayland;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RecordOptions {
@@ -71,6 +74,7 @@ pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd.stdin(Stdio::null());
+    crate::util::restore_child_environment(&mut cmd);
     cmd
 }
 
@@ -325,13 +329,9 @@ pub fn list_devices() -> Devices {
 pub fn session_blocker() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
-        if session.eq_ignore_ascii_case("wayland") {
-            return Some(
-                "Screen recording needs an X11 session on Linux (Wayland blocks ffmpeg). \
-                 Log out and choose \"Ubuntu on Xorg\" / \"X11\" on the login screen."
-                    .to_string(),
-            );
+        // Wayland records through the ScreenCast portal (see wayland.rs).
+        if crate::portal::is_wayland() {
+            return wayland::missing_parts();
         }
         if std::env::var("DISPLAY").map(|d| d.is_empty()).unwrap_or(true) {
             return Some("No X11 display found, screen recording is unavailable.".to_string());
@@ -354,6 +354,19 @@ const EVEN_SCALE: &str = "scale=trunc(iw/2)*2:trunc(ih/2)*2";
 /// finished (see [`finalize_recording`]): encoding a palette live is slow and
 /// drops frames.
 pub fn build_args(opts: &RecordOptions, output: &str) -> Vec<String> {
+    build_args_for(opts, output, &ScreenSource::Grab)
+}
+
+/// Where the screen picture of a recording comes from.
+pub enum ScreenSource {
+    /// The system's own grabber: gdigrab, avfoundation or x11grab.
+    Grab,
+    /// YUV4MPEG on ffmpeg's stdin, with an optional crop filter. Used on Wayland,
+    /// where the picture comes from the ScreenCast portal (see `wayland.rs`).
+    Pipe(Option<String>),
+}
+
+pub fn build_args_for(opts: &RecordOptions, output: &str, source: &ScreenSource) -> Vec<String> {
     let fps = if opts.fps == 0 { 30 } else { opts.fps };
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
@@ -371,9 +384,28 @@ pub fn build_args(opts: &RecordOptions, output: &str) -> Vec<String> {
     let mut pre_filter: Option<String> = None;
     let _ = (&window_mode, &window_target, &mut pre_filter);
 
+    // --- Input 0 from a pipe (Wayland)
+    let piped = if let ScreenSource::Pipe(crop) = source {
+        args.extend([
+            // Real clock time stamps keep the screen and the sound in step.
+            "-use_wallclock_as_timestamps".into(),
+            "1".into(),
+            "-thread_queue_size".into(),
+            "1024".into(),
+            "-f".into(),
+            "yuv4mpegpipe".into(),
+            "-i".into(),
+            "pipe:0".into(),
+        ]);
+        pre_filter = crop.clone();
+        true
+    } else {
+        false
+    };
+
     // --- Input 0: the screen (whole monitor, a region, or one window)
     #[cfg(windows)]
-    {
+    if !piped {
         args.extend([
             // Real clock time stamps keep the screen and the camera in step.
             "-use_wallclock_as_timestamps".into(),
@@ -417,7 +449,7 @@ pub fn build_args(opts: &RecordOptions, output: &str) -> Vec<String> {
         }
     }
     #[cfg(target_os = "macos")]
-    {
+    if !piped {
         let (video, _) = macos_device_list();
         let screen = pick_macos_screen(&video, opts.monitor);
         args.extend([
@@ -438,7 +470,7 @@ pub fn build_args(opts: &RecordOptions, output: &str) -> Vec<String> {
         }
     }
     #[cfg(target_os = "linux")]
-    {
+    if !piped {
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".into());
         args.extend([
             "-f".into(),
@@ -557,6 +589,11 @@ pub fn build_args(opts: &RecordOptions, output: &str) -> Vec<String> {
         args.push("-an".into());
     }
 
+    // A piped picture ends with its input (Wayland), while the sound inputs never
+    // end on their own: the segment has to stop with the picture.
+    if piped {
+        args.push("-shortest".into());
+    }
     args.extend(["-y".into(), output.to_string()]);
 
     // Second output: the camera, already shrunk to the size it will have in the video.
@@ -770,7 +807,7 @@ pub fn spawn_recording(output: &Path, opts: &RecordOptions) -> anyhow::Result<Ch
         anyhow::bail!(reason);
     }
     let ffmpeg = ffmpeg_path()?;
-    let args = build_args(opts, &output.to_string_lossy());
+    let (args, input) = screen_input(opts, output)?;
     crate::settings::log_line(&format!("ffmpeg {} {}", ffmpeg.display(), args.join(" ")));
 
     let _ = crate::util::ensure_dir(&crate::util::logs_dir());
@@ -781,18 +818,26 @@ pub fn spawn_recording(output: &Path, opts: &RecordOptions) -> anyhow::Result<Ch
     // rectangle no longer matches the one the user picked.
     #[cfg(windows)]
     command.env("__COMPAT_LAYER", "HighDpiAware");
-    let mut child = command
+    let mut child = match command
         .args(&args)
-        .stdin(Stdio::piped())
+        .stdin(input)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
-        .spawn()?;
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            end_screen_session();
+            return Err(err.into());
+        }
+    };
 
     // A bad device name or argument makes ffmpeg exit within a moment. Report
     // that now instead of pretending to record.
     for _ in 0..8 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if let Ok(Some(status)) = child.try_wait() {
+            end_screen_session();
             let tail = log_tail(6);
             anyhow::bail!(
                 "Recording could not start (ffmpeg exited with {}).{}{}",
@@ -805,9 +850,35 @@ pub fn spawn_recording(output: &Path, opts: &RecordOptions) -> anyhow::Result<Ch
     Ok(child)
 }
 
+/// ffmpeg arguments for one segment and what its stdin is: a pipe for the `q`
+/// that ends it, or on Wayland the video itself.
+fn screen_input(opts: &RecordOptions, output: &Path) -> anyhow::Result<(Vec<String>, Stdio)> {
+    let output = output.to_string_lossy();
+    #[cfg(target_os = "linux")]
+    if crate::portal::is_wayland() {
+        let (video, crop) = wayland::start_source(
+            opts.mode == "window",
+            opts.draw_mouse,
+            if opts.fps == 0 { 30 } else { opts.fps },
+            opts.region.as_ref(),
+        )?;
+        return Ok((build_args_for(opts, &output, &ScreenSource::Pipe(crop)), video));
+    }
+    Ok((build_args(opts, &output), Stdio::piped()))
+}
+
+/// Close the desktop's screen-sharing session of a finished take (Wayland only).
+pub fn end_screen_session() {
+    #[cfg(target_os = "linux")]
+    wayland::end_session();
+}
+
 /// Ask ffmpeg to finalise the current segment by sending `q` to its stdin.
+/// On Wayland its input is ended instead (see `wayland::stop_source`).
 pub fn stop_child(child: &mut Child) -> anyhow::Result<()> {
     use std::io::Write;
+    #[cfg(target_os = "linux")]
+    wayland::stop_source();
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(b"q");
         let _ = stdin.flush();
