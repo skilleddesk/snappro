@@ -22,7 +22,7 @@ jobs:
         include:
           - { label: Windows x64, os: windows-latest, args: "" }
           - { label: macOS Intel + Apple Silicon, os: macos-latest, args: "--target universal-apple-darwin" }
-          - { label: Linux x64, os: ubuntu-22.04, args: "" }
+          - { label: Linux x64, os: ubuntu-24.04, args: "" }
     steps:
       - uses: actions/checkout@v4
 
