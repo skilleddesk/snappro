@@ -59,7 +59,7 @@ export function MiniMode() {
   };
 
   return (
-    <div className="absolute inset-0 flex items-center">
+    <div className="absolute inset-x-0 top-0 h-12 flex items-center">
       <div className="glass-panel drag-handle rounded-xl px-2 py-1.5 flex items-center gap-1 w-full h-12 cursor-move">
         <button
           className="win-ctrl !w-8 !h-8"

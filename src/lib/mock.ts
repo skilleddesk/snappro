@@ -212,6 +212,10 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
         return sample("preview");
       case "keep_capture":
         return "C:\Users\you\Pictures\SnapPro\kept.png";
+      case "screenshot_permission_state":
+        return { needed: false };
+      case "request_screenshot_permission":
+        return null;
       case "install_dependency":
         return "installed";
       case "pending_editor_path":

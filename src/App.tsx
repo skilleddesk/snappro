@@ -146,6 +146,22 @@ export default function App() {
     void on(EVENTS.libraryChanged, () => void useStore.getState().loadLibrary()).then((fn) =>
       disposers.push(fn),
     );
+    // Linux Wayland: the desktop must be told once that SnapPro may take screenshots.
+    // The backend raises this when a capture was refused; the state is also checked
+    // at start and whenever the window is activated again.
+    if (label === "main") {
+      const store = useStore.getState();
+      void store.loadScreenshotPermission();
+      void on(EVENTS.permissionScreenshot, () => useStore.getState().setScreenshotPermissionNeeded(true)).then(
+        (fn) => disposers.push(fn),
+      );
+      void on(EVENTS.permissionScreenshotAllowed, () =>
+        useStore.getState().setScreenshotPermissionNeeded(false),
+      ).then((fn) => disposers.push(fn));
+      const recheck = () => void useStore.getState().loadScreenshotPermission();
+      window.addEventListener("focus", recheck);
+      disposers.push(() => window.removeEventListener("focus", recheck));
+    }
     // Captures triggered from a global hotkey or the tray never pass through the
     // toolbar, so the window learns about them here and still shows the toast.
     void on<api.CaptureResult>(EVENTS.captureComplete, (payload) => {

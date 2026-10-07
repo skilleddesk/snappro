@@ -419,6 +419,13 @@ export const openUrl = (url: string) => call<void>("open_url", { url });
 export const installDependency = (name: "ffmpeg" | "tesseract") =>
   call<string>("install_dependency", { name });
 
+/** Linux Wayland: whether the desktop still has to be told that SnapPro may take screenshots. */
+export const screenshotPermissionState = () =>
+  call<{ needed: boolean }>("screenshot_permission_state");
+
+/** Asks the desktop (once) to allow screenshots; the question only appears while a SnapPro window is active. */
+export const requestScreenshotPermission = () => call<void>("request_screenshot_permission");
+
 // ---------------------------------------------------------------------------
 // Library
 // ---------------------------------------------------------------------------
@@ -527,6 +534,8 @@ export const EVENTS = {
   navScrolling: "nav://scrolling",
   scrollingProgress: "scrolling://progress",
   scrollingStarted: "scrolling://started",
+  permissionScreenshot: "permission://screenshot",
+  permissionScreenshotAllowed: "permission://screenshot-allowed",
 } as const;
 
 /** Live frame counter for a running scrolling capture. */

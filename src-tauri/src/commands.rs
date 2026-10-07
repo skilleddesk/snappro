@@ -125,8 +125,30 @@ fn emit(app: &AppHandle, event: &str, payload: impl Serialize + Clone) {
 fn show_window(app: &AppHandle, label: &str) {
     if let Some(window) = app.get_webview_window(label) {
         let _ = window.show();
+        raise_above_others(app, &window);
         let _ = window.set_focus();
     }
+}
+
+/// Linux: a window that was hidden and shown again has lost its "always on top"
+/// hint, and GNOME does not let a program that is not the active one take the focus.
+/// Such a window then opened *behind* the active one, and the shortcut, tray or
+/// notification that opened it looked as if it had done nothing. Asking for
+/// "always on top" again after each show puts it in front.
+fn raise_above_others(app: &AppHandle, window: &WebviewWindow) {
+    #[cfg(target_os = "linux")]
+    {
+        let pinned = match window.label() {
+            "main" => crate::settings::load(app).always_on_top,
+            "recorder" | "region" | "preview" => true,
+            _ => false,
+        };
+        if pinned {
+            let _ = window.set_always_on_top(true);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (app, window);
 }
 
 /// Bring a window back without stealing focus from whatever the user is doing.
@@ -137,6 +159,7 @@ fn show_window(app: &AppHandle, label: &str) {
 fn show_window_passive(app: &AppHandle, label: &str) {
     if let Some(window) = app.get_webview_window(label) {
         let _ = window.show();
+        raise_above_others(app, &window);
     }
 }
 
@@ -289,6 +312,94 @@ fn timestamp_suffix() -> String {
 // Capture commands
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Screenshot permission (Wayland)
+// ---------------------------------------------------------------------------
+//
+// The desktop asks once whether SnapPro may take screenshots, and GNOME only shows
+// that question for the application whose window is active. A capture started by a
+// keyboard shortcut or the tray (or by a button, which hides SnapPro first) can
+// therefore never get the question answered: the desktop quietly refuses. SnapPro
+// notices that, brings its window forward and offers an "Allow screenshots" button
+// that asks while the window is active.
+
+static SCREENSHOT_PERMISSION_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn is_permission_error(error: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    return crate::portal::needs_screenshot_permission(error);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// Pass a capture error on; when it is the "not allowed yet" one, also bring
+/// SnapPro forward with the "Allow screenshots" button.
+fn capture_failed(app: &AppHandle, error: String) -> String {
+    if is_permission_error(&error) {
+        ask_screenshot_permission(app);
+    }
+    error
+}
+
+fn ask_screenshot_permission(app: &AppHandle) {
+    SCREENSHOT_PERMISSION_NEEDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The capture may have hidden SnapPro's windows: one must be back, or the
+    // question could not be answered later either.
+    show_window(app, "main");
+    emit(app, "permission://screenshot", ());
+    crate::feedback::notify(
+        app,
+        "SnapPro",
+        "Press \"Allow screenshots\" in the SnapPro window. Your desktop asks once.",
+    );
+}
+
+/// Whether the "Allow screenshots" button should be shown.
+#[tauri::command]
+pub fn screenshot_permission_state() -> serde_json::Value {
+    #[cfg(target_os = "linux")]
+    let needed = match crate::portal::is_wayland() {
+        false => false,
+        true => match crate::portal::screenshot_permission() {
+            Some(granted) => !granted,
+            None => SCREENSHOT_PERMISSION_NEEDED.load(std::sync::atomic::Ordering::SeqCst),
+        },
+    };
+    #[cfg(not(target_os = "linux"))]
+    let needed = false;
+    serde_json::json!({ "needed": needed })
+}
+
+/// The "Allow screenshots" button: takes one screenshot without hiding anything, so
+/// the desktop's question can appear on top of the active SnapPro window. The
+/// picture itself is thrown away.
+#[tauri::command]
+pub async fn request_screenshot_permission(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let outcome = tauri::async_runtime::spawn_blocking(|| {
+            crate::portal::forget_screenshot_denial();
+            crate::portal::screenshot(false).map(|_| ())
+        })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string());
+        if outcome.is_ok() {
+            SCREENSHOT_PERMISSION_NEEDED.store(false, std::sync::atomic::Ordering::SeqCst);
+            emit(&app, "permission://screenshot-allowed", ());
+        }
+        return outcome;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        Ok(())
+    }
+}
+
 /// Capture every display at once, stitched on the virtual desktop grid.
 #[tauri::command]
 pub async fn capture_all_monitors(app: AppHandle) -> Result<CaptureResult, String> {
@@ -305,7 +416,7 @@ pub async fn capture_all_monitors(app: AppHandle) -> Result<CaptureResult, Strin
     .map_err(|e| e.to_string());
 
     restore_main(&app, was_visible);
-    let result = outcome?;
+    let result = outcome.map_err(|e| capture_failed(&app, e))?;
 
     Ok(after_capture(&app, &result))
 }
@@ -328,7 +439,7 @@ pub async fn capture_full_screen(app: AppHandle, monitor: Option<usize>) -> Resu
     .map_err(|e| e.to_string());
 
     restore_main(&app, was_visible);
-    let result = outcome?;
+    let result = outcome.map_err(|e| capture_failed(&app, e))?;
 
     Ok(after_capture(&app, &result))
 }
@@ -376,7 +487,7 @@ pub async fn capture_region(
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string());
 
-    let result = outcome?;
+    let result = outcome.map_err(|e| capture_failed(&app, e))?;
     Ok(after_capture(&app, &result))
 }
 
@@ -419,7 +530,7 @@ pub async fn capture_freehand(app: AppHandle, points: Vec<(f32, f32)>) -> Result
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string());
 
-    let result = outcome?;
+    let result = outcome.map_err(|e| capture_failed(&app, e))?;
     Ok(after_capture(&app, &result))
 }
 
@@ -438,7 +549,7 @@ pub async fn capture_window(app: AppHandle, window_id: Option<u32>) -> Result<Ca
     .map_err(|e| e.to_string());
 
     restore_main(&app, was_visible);
-    let result = outcome?;
+    let result = outcome.map_err(|e| capture_failed(&app, e))?;
 
     Ok(after_capture(&app, &result))
 }
@@ -519,7 +630,7 @@ pub async fn capture_scrolling(
     if selector_restores_main(&app) {
         show_window_passive(&app, "main");
     }
-    let result = outcome?;
+    let result = outcome.map_err(|e| capture_failed(&app, e))?;
     Ok(after_capture(&app, &result))
 }
 
@@ -619,7 +730,7 @@ pub async fn capture_delayed(app: AppHandle, seconds: Option<u64>) -> Result<Cap
     .map_err(|e| e.to_string());
 
     restore_main(&app, was_visible);
-    let result = outcome?;
+    let result = outcome.map_err(|e| capture_failed(&app, e))?;
 
     Ok(after_capture(&app, &result))
 }
@@ -661,7 +772,18 @@ pub async fn start_region_selector(
     })
     .await
     .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string());
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            // Without the picture there is no overlay: give the windows back, or
+            // SnapPro would look as if it had vanished.
+            if restore_main {
+                show_window_passive(&app, "main");
+            }
+            return Err(capture_failed(&app, error));
+        }
+    };
 
     let (image, monitor_label, ox, oy, width, height) = snapshot;
     let dir = crate::util::session_dir();
@@ -688,6 +810,7 @@ pub async fn start_region_selector(
     let _ = window.set_position(tauri::PhysicalPosition::new(vx, vy));
     let _ = window.set_size(tauri::PhysicalSize::new(vw, vh));
     window.show().map_err(|e| e.to_string())?;
+    raise_above_others(&app, &window);
     let _ = window.set_focus();
 
     let scale = window.scale_factor().unwrap_or(1.0);
@@ -1833,8 +1956,16 @@ pub fn hotkey_action(app: AppHandle, index: usize) {
             }
             Err(err) => {
                 crate::settings::log_line(&format!("hotkey action failed: {}", err));
-                // Nobody is watching a hotkey capture, so say what went wrong.
-                crate::feedback::notify(&handle, "SnapPro", &format!("Capture failed: {}", err));
+                if is_permission_error(&err.to_string()) {
+                    // Brings SnapPro forward with the "Allow screenshots" button.
+                    ask_screenshot_permission(&handle);
+                } else if err.to_string() == "Screenshot cancelled" {
+                    // The person closed the desktop's picker: nothing went wrong.
+                    return;
+                } else {
+                    // Nobody is watching a hotkey capture, so say what went wrong.
+                    crate::feedback::notify(&handle, "SnapPro", &format!("Capture failed: {}", err));
+                }
                 emit(&handle, "capture://failed", err.to_string());
             }
         }

@@ -4,6 +4,7 @@ import * as api from "../lib/api";
 import { useStore } from "../lib/store";
 import { Panels } from "./Panels";
 import { MiniMode } from "./MiniMode";
+import { PermissionBanner } from "./PermissionBanner";
 import { nativeWindow } from "../lib/window";
 import { prettyAccelerator } from "../lib/recording";
 import { targetMonitorIndex } from "./targetMonitor";
@@ -125,14 +126,22 @@ function QuickBar() {
 export function Toolbar() {
   const settings = useStore((s) => s.settings);
   const miniMode = Boolean(settings?.miniMode);
+  const permissionNeeded = useStore((s) => s.screenshotPermissionNeeded);
 
   // Sizing belongs here, not inside MiniMode: entering the full panel unmounts
-  // MiniMode, so a resize effect living there never ran.
+  // MiniMode, so a resize effect living there never ran. The quick bar grows
+  // while the "Allow screenshots" notice is shown under it.
   useEffect(() => {
-    void api.setWindowSize(miniMode ? 372 : 372, miniMode ? 56 : 668, "main");
-  }, [miniMode]);
+    void api.setWindowSize(372, miniMode ? (permissionNeeded ? 176 : 56) : 668, "main");
+  }, [miniMode, permissionNeeded]);
 
-  if (miniMode) return <QuickBar />;
+  if (miniMode)
+    return (
+      <>
+        <QuickBar />
+        <PermissionBanner className="absolute left-1 right-1 top-[54px]" />
+      </>
+    );
   return <FullPanel />;
 }
 
@@ -328,6 +337,8 @@ function FullPanel() {
         style={{ width: 372, height: "calc(100vh - 8px)" }}
       >
         <Header />
+
+        <PermissionBanner className="mx-3.5 mt-2.5" />
 
         <div className="px-3.5 pt-2.5">
           <button

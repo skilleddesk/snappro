@@ -296,7 +296,7 @@ export function RecorderSetup() {
             ))}
             {desktopAsks ? (
               <div className="text-[10px] leading-relaxed text-slate-400 px-1">
-                The first time, your desktop asks which screen to share: pick the same one there.
+                Your desktop asks which screen to share the first time. Pick it, tick “Remember this selection” and press Share: it will not ask again.
               </div>
             ) : null}
             {monitors.length > 1 && allBounds && !desktopAsks ? (

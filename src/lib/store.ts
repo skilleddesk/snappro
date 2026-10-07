@@ -40,7 +40,11 @@ interface AppState {
   toasts: Toast[];
   dependencies: api.DependencyReport | null;
   monitors: api.MonitorInfo[];
+  /** Linux Wayland: the desktop has not yet been told that screenshots are allowed. */
+  screenshotPermissionNeeded: boolean;
 
+  setScreenshotPermissionNeeded: (needed: boolean) => void;
+  loadScreenshotPermission: () => Promise<void>;
   setView: (view: View) => void;
   back: () => void;
   setStatus: (status: Status, text?: string) => void;
@@ -83,6 +87,18 @@ export const useStore = create<AppState>((set, get) => ({
   toasts: [],
   dependencies: null,
   monitors: [],
+  screenshotPermissionNeeded: false,
+
+  setScreenshotPermissionNeeded: (needed) => set({ screenshotPermissionNeeded: needed }),
+  loadScreenshotPermission: async () => {
+    try {
+      const state = await api.screenshotPermissionState();
+      set({ screenshotPermissionNeeded: Boolean(state?.needed) });
+    } catch {
+      // No permission system to ask (Windows, macOS, browser preview): nothing to show.
+      set({ screenshotPermissionNeeded: false });
+    }
+  },
 
   setView: (view) => set({ view, previousView: get().view }),
   back: () => set({ view: get().previousView === get().view ? "home" : get().previousView }),

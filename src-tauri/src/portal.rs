@@ -14,6 +14,25 @@ pub const PATH: &str = "/org/freedesktop/portal/desktop";
 /// Error text when the person closed the portal dialog instead of allowing it.
 pub const CANCELLED: &str = "cancelled";
 
+/// Error text when the portal ended the request without an answer (response 2).
+/// For a screenshot that means the desktop refused it, nearly always because the
+/// one-time "allow screenshots" question could not be shown: GNOME only lets the
+/// application whose window has the focus show that question.
+pub const REFUSED: &str = "refused";
+
+/// Starts every error that means "SnapPro has no permission to take screenshots
+/// yet", so callers can tell it from a failed capture (see `needs_screenshot_permission`).
+pub const SCREENSHOT_PERMISSION_MESSAGE: &str = "SnapPro is not allowed to take screenshots yet. \
+Open SnapPro and press \"Allow screenshots\": your desktop asks once, and only while a SnapPro window is active.";
+
+/// Error text of a screenshot the person closed the desktop's picker without taking.
+pub const SCREENSHOT_CANCELLED: &str = "Screenshot cancelled";
+
+/// True for the error text of a screenshot the desktop refused for lack of permission.
+pub fn needs_screenshot_permission(error: &str) -> bool {
+    error.contains("SnapPro is not allowed to take screenshots yet")
+}
+
 /// True in a Wayland session, also when SnapPro's own windows run through XWayland.
 pub fn is_wayland() -> bool {
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
@@ -54,7 +73,8 @@ where
     match code {
         0 => Ok(results),
         1 => anyhow::bail!(CANCELLED),
-        _ => anyhow::bail!("the desktop portal refused the request"),
+        2 => anyhow::bail!(REFUSED),
+        other => anyhow::bail!("the desktop portal answered with code {other}"),
     }
 }
 
@@ -106,12 +126,12 @@ pub fn screenshot(interactive: bool) -> anyhow::Result<RgbaImage> {
         &("", options),
         &token,
     )
-    .map_err(|e| {
-        if e.to_string() == CANCELLED {
-            anyhow::anyhow!("Screenshot cancelled")
-        } else {
-            anyhow::anyhow!("The desktop did not allow a screenshot: {e}")
-        }
+    .map_err(|e| match e.to_string().as_str() {
+        CANCELLED => anyhow::anyhow!(SCREENSHOT_CANCELLED),
+        // The desktop's own picker answers 2 when it is closed without a picture.
+        REFUSED if interactive => anyhow::anyhow!(SCREENSHOT_CANCELLED),
+        REFUSED => anyhow::anyhow!(SCREENSHOT_PERMISSION_MESSAGE),
+        _ => anyhow::anyhow!("The desktop did not allow a screenshot: {e}"),
     })?;
     let path = results
         .uri
@@ -190,5 +210,102 @@ pub fn stop_gstreamer(mut child: std::process::Child) {
 pub fn close_session(conn: &Connection, session: &OwnedObjectPath) {
     if let Ok(proxy) = Proxy::new(conn, DEST, session, "org.freedesktop.portal.Session") {
         let _ = proxy.call_method("Close", &());
+    }
+}
+
+/// The id the desktop knows this program by, taken from the systemd scope the
+/// desktop started it in (`app-gnome-SnapPro-1234.scope` -> `SnapPro`). `None`
+/// when SnapPro was not started by the desktop (a terminal, for example).
+pub fn own_app_id() -> Option<String> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    app_id_from_cgroup(&cgroup)
+}
+
+/// See [`own_app_id`]; separate so it can be tested.
+pub fn app_id_from_cgroup(cgroup: &str) -> Option<String> {
+    let unit = cgroup.lines().filter_map(|l| l.rsplit('/').next()).find(|u| u.starts_with("app-"))?;
+    let name = unit.strip_suffix(".scope").or_else(|| unit.strip_suffix(".service"))?;
+    // systemd writes a dash inside a name as \x2d.
+    let name = name.replace("\\x2d", "-");
+    let name = name.strip_prefix("app-")?;
+    // Started at login: `app-gnome-SnapPro@autostart`. Otherwise the process id ends the name.
+    let name = match name.split_once('@') {
+        Some((name, _)) => name,
+        None => {
+            let (name, pid) = name.rsplit_once('-')?;
+            if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            name
+        }
+    };
+    // Drop the launcher in front of the name.
+    let name = ["gnome-", "kde-", "dbus-"].iter().find_map(|l| name.strip_prefix(l)).unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// File that keeps a "remember my answer" token of the desktop for this program.
+///
+/// The desktop ties such a token to the identity of the program that got it
+/// ([`own_app_id`]), and a token of another identity makes it ask again. SnapPro is
+/// started in different ways (application menu, login, a terminal) that have
+/// different identities, so each identity keeps its own file; one shared file made
+/// them wipe each other's token and the "Share Screen" question came back every time.
+pub fn token_file(kind: &str) -> std::path::PathBuf {
+    crate::util::app_data_dir().join(token_file_name(kind, own_app_id().as_deref()))
+}
+
+/// See [`token_file`]; separate so it can be tested.
+pub fn token_file_name(kind: &str, app_id: Option<&str>) -> String {
+    let id: String = app_id
+        .unwrap_or("default")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect();
+    format!("{kind}-{id}.token")
+}
+
+/// Whether this program is allowed to take screenshots, as recorded by the
+/// desktop: `Some(true/false)`, or `None` when that cannot be told (SnapPro was not
+/// started by the desktop, or the desktop keeps no such record).
+pub fn screenshot_permission() -> Option<bool> {
+    let id = own_app_id()?;
+    let conn = Connection::session().ok()?;
+    let store = Proxy::new(
+        &conn,
+        "org.freedesktop.impl.portal.PermissionStore",
+        "/org/freedesktop/impl/portal/PermissionStore",
+        "org.freedesktop.impl.portal.PermissionStore",
+    )
+    .ok()?;
+    match store.call::<_, _, (HashMap<String, Vec<String>>, zbus::zvariant::OwnedValue)>("Lookup", &("screenshot", "screenshot")) {
+        Ok((entries, _)) => Some(entries.get(&id).map(|p| p.iter().any(|p| p == "yes")).unwrap_or(false)),
+        // The table does not exist until some program was answered once.
+        Err(_) => Some(false),
+    }
+}
+
+/// A "no" recorded earlier makes the desktop refuse without asking again. Pressing
+/// "Allow screenshots" asks for the question again, so a recorded "no" for SnapPro is
+/// removed first; the answer to the question is still the person's to give.
+pub fn forget_screenshot_denial() {
+    let Some(id) = own_app_id() else { return };
+    let Ok(conn) = Connection::session() else { return };
+    let Ok(store) = Proxy::new(
+        &conn,
+        "org.freedesktop.impl.portal.PermissionStore",
+        "/org/freedesktop/impl/portal/PermissionStore",
+        "org.freedesktop.impl.portal.PermissionStore",
+    ) else {
+        return;
+    };
+    let lookup = store.call::<_, _, (HashMap<String, Vec<String>>, zbus::zvariant::OwnedValue)>(
+        "Lookup",
+        &("screenshot", "screenshot"),
+    );
+    if let Ok((entries, _)) = lookup {
+        if entries.get(&id).map(|p| !p.iter().any(|p| p == "yes")).unwrap_or(false) {
+            let _ = store.call_method("DeletePermission", &("screenshot", "screenshot", id.as_str()));
+        }
     }
 }

@@ -78,7 +78,7 @@ pub struct WaylandScroller {
 }
 
 fn token_path() -> std::path::PathBuf {
-    crate::util::app_data_dir().join("remote-desktop.token")
+    crate::portal::token_file("remote-desktop")
 }
 
 fn portal_error(err: anyhow::Error) -> anyhow::Error {

@@ -66,7 +66,7 @@ struct StartResults {
 }
 
 fn restore_token_path(source_type: u32) -> std::path::PathBuf {
-    crate::util::app_data_dir().join(format!("screencast-{source_type}.token"))
+    crate::portal::token_file(&format!("screencast-{source_type}"))
 }
 
 fn portal_error(what: &str, err: anyhow::Error) -> anyhow::Error {

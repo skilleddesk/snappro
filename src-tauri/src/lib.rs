@@ -169,6 +169,8 @@ pub fn run() {
             commands::copy_image_data,
             commands::open_url,
             commands::install_dependency,
+            commands::screenshot_permission_state,
+            commands::request_screenshot_permission,
         ])
         .build(tauri::generate_context!())
         .expect("error while building SnapPro")

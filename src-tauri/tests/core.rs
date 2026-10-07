@@ -101,11 +101,29 @@ fn recording_in_a_region_passes_the_crop() {
     );
 }
 
+/// On Wayland the desktop asks a person before it shares the screen (the first time,
+/// and again whenever the remembered answer does not belong to the program that
+/// asks), so tests that record the real screen only run there when asked to:
+/// `SNAPPRO_TEST_PORTAL=1 cargo test`. Elsewhere they run as before.
+fn needs_a_person() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        snappro_lib::portal::is_wayland() && std::env::var_os("SNAPPRO_TEST_PORTAL").is_none()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// End-to-end: really record a few seconds of the screen with ffmpeg and check
 /// that a playable file lands on disk.
 #[test]
 fn recording_writes_a_real_video_file() {
     use snappro_lib::recorder::{spawn_recording, stop_child, RecordOptions};
+    if needs_a_person() {
+        return;
+    }
 
     let dir = std::env::temp_dir().join(format!("snappro-rec-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -706,6 +724,9 @@ fn flat_pages_report_no_shift() {
 #[test]
 fn paused_recordings_are_joined_and_gif_is_converted() {
     use snappro_lib::recorder::{finalize_recording, spawn_recording, stop_child, RecordOptions};
+    if needs_a_person() {
+        return;
+    }
 
     let dir = std::env::temp_dir().join(format!("snappro-final-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1038,4 +1059,46 @@ fn scrolling_badge_keeps_clear_of_the_capture_area() {
     // The whole screen, or too close to every corner: nowhere to go.
     assert_eq!(badge_corner(screen, (0, 0, 1366, 768), (310, 70)), None);
     assert_eq!(badge_corner(screen, (20, 20, 1326, 728), (310, 70)), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn desktop_app_id_comes_from_the_systemd_scope() {
+    use snappro_lib::portal::{app_id_from_cgroup, needs_screenshot_permission, SCREENSHOT_PERMISSION_MESSAGE};
+    // Started from the application menu or by a GNOME shortcut.
+    assert_eq!(
+        app_id_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-SnapPro-156450.scope\n").as_deref(),
+        Some("SnapPro")
+    );
+    // Without a launcher in the name, and with an escaped dash in the id.
+    assert_eq!(
+        app_id_from_cgroup("0::/user.slice/user@1000.service/app.slice/app-SnapPro-4242.scope").as_deref(),
+        Some("SnapPro")
+    );
+    assert_eq!(
+        app_id_from_cgroup("0::/user.slice/user@1000.service/app.slice/app-gnome-snap\\x2dpro-9.scope").as_deref(),
+        Some("snap-pro")
+    );
+    // Started at login by the desktop's autostart.
+    assert_eq!(
+        app_id_from_cgroup("0::/user.slice/user@1000.service/app.slice/app-gnome-SnapPro@autostart.service").as_deref(),
+        Some("SnapPro")
+    );
+    // Every identity keeps its own "remember my answer" token.
+    use snappro_lib::portal::token_file_name;
+    assert_eq!(token_file_name("screencast-1", Some("SnapPro")), "screencast-1-SnapPro.token");
+    assert_eq!(token_file_name("screencast-1", Some("com.microsoft.VSCode")), "screencast-1-com.microsoft.VSCode.token");
+    assert_eq!(token_file_name("remote-desktop", None), "remote-desktop-default.token");
+    assert_eq!(token_file_name("x", Some("a/b c")), "x-a_b_c.token");
+    // A terminal or a service has no application scope: unknown.
+    assert_eq!(app_id_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope"), None);
+    assert_eq!(app_id_from_cgroup("0::/user.slice/user@1000.service/app.slice/app-gnome-SnapPro.scope"), None);
+    assert_eq!(app_id_from_cgroup(""), None);
+
+    // The error text the capture code produces is recognised again at the other end.
+    assert!(needs_screenshot_permission(SCREENSHOT_PERMISSION_MESSAGE));
+    assert!(needs_screenshot_permission(&format!("Capture failed: {SCREENSHOT_PERMISSION_MESSAGE}")));
+    assert!(!needs_screenshot_permission(snappro_lib::portal::SCREENSHOT_CANCELLED));
+    assert!(!needs_screenshot_permission("Screenshot cancelled"));
+    assert!(!needs_screenshot_permission("no monitor found"));
 }
