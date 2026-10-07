@@ -394,9 +394,13 @@ export function RegionOverlay() {
       { x: 12, y: viewport.h - badge.h - 12, w: badge.w, h: badge.h },
       { x: viewport.w - badge.w - 12, y: viewport.h - badge.h - 12, w: badge.w, h: badge.h },
     ];
-    const free = corners.find((c) =>
-      !rect || c.x + c.w < rect.x - 8 || c.x > rect.x + rect.w + 8 || c.y + c.h < rect.y - 8 || c.y > rect.y + rect.h + 8,
-    );
+    // On Wayland the window itself shrinks to the badge and moves clear of the area.
+    const compact = viewport.w < badge.w + 60;
+    const free = compact
+      ? corners[0]
+      : corners.find((c) =>
+          !rect || c.x + c.w < rect.x - 8 || c.x > rect.x + rect.w + 8 || c.y + c.h < rect.y - 8 || c.y > rect.y + rect.h + 8,
+        );
     return (
       <div className="fixed inset-0 pointer-events-none">
         {free ? (

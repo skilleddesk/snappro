@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use image::RgbaImage;
 use serde::de::DeserializeOwned;
 use zbus::blocking::{Connection, Proxy};
-use zbus::zvariant::{DeserializeDict, DynamicType, Type, Value};
+use zbus::zvariant::{DeserializeDict, DynamicType, ObjectPath, OwnedObjectPath, Type, Value};
 
 pub const DEST: &str = "org.freedesktop.portal.Desktop";
 pub const PATH: &str = "/org/freedesktop/portal/desktop";
@@ -121,4 +121,74 @@ pub fn screenshot(interactive: bool) -> anyhow::Result<RgbaImage> {
     let picture = image::open(&path).map(|img| img.to_rgba8());
     let _ = std::fs::remove_file(&path);
     Ok(picture?)
+}
+
+/// Start `gst-launch-1.0 <args>` on the PipeWire stream of an open ScreenCast (or
+/// RemoteDesktop) portal session. The PipeWire connection is handed over as fd 3,
+/// so the pipeline begins with `pipewiresrc fd=3 path=<node>`; stdout is piped.
+pub fn spawn_gstreamer(
+    conn: &Connection,
+    session: &OwnedObjectPath,
+    args: &[String],
+    log_name: &str,
+) -> anyhow::Result<std::process::Child> {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let portal = Proxy::new(conn, DEST, PATH, "org.freedesktop.portal.ScreenCast")?;
+    let options: HashMap<&str, Value> = HashMap::new();
+    let fd: zbus::zvariant::OwnedFd = portal.call("OpenPipeWireRemote", &(ObjectPath::from(session), options))?;
+    let fd: OwnedFd = fd.into();
+
+    crate::settings::log_line(&format!("gst-launch-1.0 {}", args.join(" ")));
+    let _ = crate::util::ensure_dir(&crate::util::logs_dir());
+    let mut command = Command::new("gst-launch-1.0");
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(std::fs::File::create(crate::util::logs_dir().join(log_name))?));
+    crate::util::restore_child_environment(&mut command);
+    let raw = fd.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            if raw == 3 {
+                let flags = libc::fcntl(3, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(raw, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("GStreamer (gst-launch-1.0) could not be started: {e}"))?;
+    drop(fd);
+    Ok(child)
+}
+
+/// Ask a GStreamer process to finish (EOS) and wait a moment for it.
+pub fn stop_gstreamer(mut child: std::process::Child) {
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    for _ in 0..40 {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Close a portal session (its "sharing" indicator goes away).
+pub fn close_session(conn: &Connection, session: &OwnedObjectPath) {
+    if let Ok(proxy) = Proxy::new(conn, DEST, session, "org.freedesktop.portal.Session") {
+        let _ = proxy.call_method("Close", &());
+    }
 }

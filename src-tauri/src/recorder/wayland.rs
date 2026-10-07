@@ -13,8 +13,6 @@
 //! either.
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
@@ -145,9 +143,7 @@ fn open_cast(source_type: u32, cursor: bool) -> anyhow::Result<Cast> {
 }
 
 fn close_cast(cast: Cast) {
-    if let Ok(proxy) = Proxy::new(&cast.conn, DEST, &cast.session, "org.freedesktop.portal.Session") {
-        let _ = proxy.call_method("Close", &());
-    }
+    crate::portal::close_session(&cast.conn, &cast.session);
 }
 
 /// End the portal session (the desktop's "sharing your screen" indicator goes away).
@@ -161,20 +157,9 @@ pub fn end_session() {
 /// Ask GStreamer to finish (EOS), which closes ffmpeg's input so the segment is
 /// finalised; ffmpeg cannot be sent `q` because its stdin carries the video.
 pub fn stop_source() {
-    let Some(mut child) = SOURCE.lock().unwrap().take() else {
-        return;
-    };
-    unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    if let Some(child) = SOURCE.lock().unwrap().take() {
+        crate::portal::stop_gstreamer(child);
     }
-    for _ in 0..40 {
-        if let Ok(Some(_)) = child.try_wait() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// ffmpeg crop filter that cuts `region` (desktop coordinates) out of the shared
@@ -225,40 +210,8 @@ pub fn start_source(window: bool, cursor: bool, fps: u32, region: Option<&Region
     }
     let cast = guard.as_ref().expect("cast is open");
 
-    let portal = Proxy::new(&cast.conn, DEST, PATH, SCREENCAST)?;
-    let options: HashMap<&str, Value> = HashMap::new();
-    let fd: zbus::zvariant::OwnedFd = portal.call("OpenPipeWireRemote", &(ObjectPath::from(&cast.session), options))?;
-    let fd: OwnedFd = fd.into();
-
     let fps = fps.clamp(1, 120);
-    let args = gst_args(cast.node, fps);
-    crate::settings::log_line(&format!("gst-launch-1.0 {}", args.join(" ")));
-    let mut command = Command::new("gst-launch-1.0");
-    command
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::from(std::fs::File::create(crate::util::logs_dir().join("gstreamer.log"))?));
-    crate::util::restore_child_environment(&mut command);
-    let raw = fd.as_raw_fd();
-    // The PipeWire connection is handed to GStreamer as fd 3.
-    unsafe {
-        command.pre_exec(move || {
-            if raw == 3 {
-                let flags = libc::fcntl(3, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            } else if libc::dup2(raw, 3) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().map_err(|e| {
-        anyhow::anyhow!("GStreamer (gst-launch-1.0) could not be started: {e}")
-    })?;
-    drop(fd);
+    let mut child = crate::portal::spawn_gstreamer(&cast.conn, &cast.session, &gst_args(cast.node, fps), "gstreamer.log")?;
     let stdout = child
         .stdout
         .take()

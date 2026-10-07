@@ -462,7 +462,7 @@ pub async fn capture_scrolling(
     // left the user staring at their desktop with no idea anything was running.
     // Making it click-through keeps the progress readout visible instead.
     if let Some(window) = app.get_webview_window("region") {
-        let _ = window.set_ignore_cursor_events(true);
+        overlay_out_of_the_way(&app, &window, (x, y, width, height));
     }
     emit(&app, "scrolling://started", ());
     // Give the overlay time to clear its frozen backdrop: anything it still draws
@@ -521,6 +521,77 @@ pub async fn capture_scrolling(
     }
     let result = outcome?;
     Ok(after_capture(&app, &result))
+}
+
+/// Keep the selector overlay from catching the wheel events of a scrolling capture.
+///
+/// Normally it turns click-through. Wayland ignores that for the full-screen
+/// overlay, which then swallowed every wheel step so nothing scrolled: there it
+/// shrinks to the progress badge in a corner the capture area does not touch.
+fn overlay_out_of_the_way(app: &AppHandle, window: &WebviewWindow, area: (i32, i32, u32, u32)) {
+    #[cfg(target_os = "linux")]
+    if crate::portal::is_wayland() {
+        let screen = app
+            .try_state::<SelectorState>()
+            .and_then(|state| state.0.lock().ok().and_then(|info| info.clone()))
+            .map(|info| (info.x, info.y, info.width, info.height))
+            .or_else(|| crate::capture::full::virtual_bounds().ok());
+        let scale = window.scale_factor().unwrap_or(1.0);
+        // The badge the overlay draws at (12, 12), with room around it.
+        let (bw, bh) = ((310.0 * scale) as u32, (70.0 * scale) as u32);
+        let spot = screen.and_then(|screen| badge_corner(screen, area, (bw, bh)));
+        match spot {
+            Some((bx, by)) => {
+                // A fixed-size GTK window does not shrink below its configured size,
+                // and an invisible 900x600 window would still catch the wheel.
+                let _ = window.set_resizable(true);
+                let _ = window.set_min_size(Some(tauri::PhysicalSize::new(1u32, 1u32)));
+                let _ = window.set_size(tauri::PhysicalSize::new(bw, bh));
+                let _ = window.set_position(tauri::PhysicalPosition::new(bx, by));
+                // The desktop may push the window elsewhere (below the top bar, for
+                // one): if it ends up near the area after all, it is hidden instead.
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                let placed = match (window.outer_position(), window.outer_size()) {
+                    (Ok(p), Ok(s)) => Some((p.x - BADGE_CLEARANCE, p.y - BADGE_CLEARANCE, s.width + 2 * BADGE_CLEARANCE as u32, s.height + 2 * BADGE_CLEARANCE as u32)),
+                    _ => None,
+                };
+                if placed.map_or(true, |rect| crate::capture::full::intersect_rect(rect, area).is_some()) {
+                    let _ = window.hide();
+                }
+            }
+            None => {
+                let _ = window.hide();
+            }
+        }
+        return;
+    }
+    let _ = app;
+    let _ = area;
+    let _ = window.set_ignore_cursor_events(true);
+}
+
+/// Gap kept between the progress badge and the capture area (pixels).
+const BADGE_CLEARANCE: i32 = 24;
+
+/// Top-left of a `badge`-sized rectangle in a corner of `screen` that keeps clear
+/// of `area` (all in global pixels): of the free corners, the one farthest away.
+pub fn badge_corner(screen: (i32, i32, u32, u32), area: (i32, i32, u32, u32), badge: (u32, u32)) -> Option<(i32, i32)> {
+    let (sx, sy, sw, sh) = screen;
+    let (bw, bh) = (badge.0 as i32, badge.1 as i32);
+    let right = sx + sw as i32 - bw;
+    let bottom = sy + sh as i32 - bh;
+    let (ax, ay, aw, ah) = (area.0, area.1, area.2 as i32, area.3 as i32);
+    let gap = |cx: i32, cy: i32| {
+        let dx = (ax - (cx + bw)).max(cx - (ax + aw)).max(0);
+        let dy = (ay - (cy + bh)).max(cy - (ay + ah)).max(0);
+        dx.max(dy)
+    };
+    // Reversed so that, of equally good corners, the first in reading order wins.
+    [(sx, sy), (right, sy), (sx, bottom), (right, bottom)]
+        .into_iter()
+        .rev()
+        .filter(|&(cx, cy)| gap(cx, cy) >= BADGE_CLEARANCE)
+        .max_by_key(|&(cx, cy)| gap(cx, cy))
 }
 
 /// Capture with a countdown, letting the user prepare their screen first.

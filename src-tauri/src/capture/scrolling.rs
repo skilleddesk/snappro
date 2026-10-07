@@ -116,12 +116,45 @@ pub fn find_shift(prev: &RgbaImage, next: &RgbaImage, expected: Option<u32>) -> 
         .filter(|(_, s)| *s <= best + 0.6)
         .map(|(shift, _)| *shift)
         .collect();
+    // Look-alike lines (lists, tables, code) match the band at several offsets,
+    // one line height apart. Only the real offset also fits the rest of the
+    // overlap, so the candidates are compared over all of it.
+    let candidates = if near_best.len() > 1 {
+        let scored: Vec<(u32, f32)> = near_best
+            .iter()
+            .map(|&shift| (shift, overlap_diff(prev, next, shift, band_start)))
+            .collect();
+        let best_overlap = scored.iter().map(|(_, d)| *d).fold(f32::MAX, f32::min);
+        scored
+            .into_iter()
+            .filter(|(_, d)| *d <= best_overlap + 0.15)
+            .map(|(shift, _)| shift)
+            .collect()
+    } else {
+        near_best
+    };
     match expected {
-        Some(target) => near_best
+        Some(target) => candidates
             .into_iter()
             .min_by_key(|shift| (*shift as i64 - target as i64).abs()),
-        None => near_best.into_iter().min(),
+        None => candidates.into_iter().min(),
     }
+}
+
+/// Mean difference between `next` and `prev` moved up by `shift`, over the whole
+/// overlap below `from` (which skips a sticky header) and above the bottom tenth
+/// of `prev` (which skips a sticky footer).
+fn overlap_diff(prev: &RgbaImage, next: &RgbaImage, shift: u32, from: u32) -> f32 {
+    let h = prev.height().min(next.height());
+    let end = (h * 9 / 10).saturating_sub(shift);
+    if end <= from {
+        return 255.0;
+    }
+    let mut total = 0f32;
+    for y in from..end {
+        total += row_diff_sparse(next, y, prev, y + shift, 2);
+    }
+    total / (end - from) as f32
 }
 
 /// Find the vertical overlap (pixels) between two consecutive frames by
@@ -271,6 +304,65 @@ pub fn stitch_vertical(frames: &[RgbaImage]) -> anyhow::Result<RgbaImage> {
 /// Pixel limit so a runaway page cannot exhaust memory.
 const MAX_STITCHED_HEIGHT: u32 = 30_000;
 
+/// What scrolling capture needs from the system: pictures of the capture area,
+/// and a mouse wheel over it.
+pub trait ScrollDriver {
+    /// A current picture of the capture area.
+    fn frame(&mut self) -> anyhow::Result<RgbaImage>;
+    /// Put the pointer over the capture area (the wheel scrolls what is under it).
+    fn park(&mut self);
+    /// Turn the wheel; positive is down.
+    fn scroll(&mut self, notches: i32);
+    /// Pause after a big wheel turn while looking for the top of the page.
+    fn quick_settle(&self) -> Duration {
+        Duration::from_millis(60)
+    }
+}
+
+/// Windows, macOS and X11: synthesised wheel events and direct screen grabs.
+struct DesktopDriver {
+    enigo: Enigo,
+    region: (i32, i32, u32, u32),
+}
+
+impl DesktopDriver {
+    fn new(region: (i32, i32, u32, u32)) -> anyhow::Result<Self> {
+        let enigo = Enigo::new(&Settings::default()).map_err(|e| {
+            anyhow::anyhow!(
+                "Scrolling capture needs permission to control the mouse wheel ({e}). \
+                 On macOS allow SnapPro under Privacy & Security > Accessibility."
+            )
+        })?;
+        Ok(Self { enigo, region })
+    }
+}
+
+impl ScrollDriver for DesktopDriver {
+    fn frame(&mut self) -> anyhow::Result<RgbaImage> {
+        let (x, y, w, h) = self.region;
+        crate::capture::full::capture_region_raw(x, y, w, h)
+    }
+
+    fn park(&mut self) {
+        let (x, y, w, h) = self.region;
+        let _ = self.enigo.move_mouse(x + (w as i32 / 2).max(1), y + (h as i32 / 2).max(1), enigo::Coordinate::Abs);
+    }
+
+    fn scroll(&mut self, notches: i32) {
+        let _ = self.enigo.scroll(notches, Axis::Vertical);
+    }
+}
+
+/// The driver for this system. Wayland: one portal session for the screen stream
+/// and the wheel, which the desktop asks permission for only once.
+fn open_driver(region: (i32, i32, u32, u32)) -> anyhow::Result<Box<dyn ScrollDriver>> {
+    #[cfg(target_os = "linux")]
+    if crate::portal::is_wayland() {
+        return Ok(Box::new(crate::capture::wayland_scroll::WaylandScroller::open(region)?));
+    }
+    Ok(Box::new(DesktopDriver::new(region)?))
+}
+
 /// Capture a tall region by scrolling and stitching the frames together.
 ///
 /// `scroll_amount` is a hint for how many wheel notches to send per step
@@ -290,33 +382,44 @@ pub fn capture_scrolling(
     on_progress: Option<&dyn Fn(u32, u32)>,
     should_stop: Option<&dyn Fn() -> bool>,
 ) -> anyhow::Result<CaptureResult> {
+    let mut driver = open_driver((x, y, width, height))?;
+    let (stitched, count) = scroll_and_stitch(driver.as_mut(), height, max_frames, scroll_amount, delay_ms, on_progress, should_stop)?;
+    crate::capture::full::save_rgba(
+        stitched,
+        "Scrolling",
+        format,
+        dir,
+        "scrolling",
+        format!("{} frames stitched", count),
+    )
+}
+
+/// Scroll to the top, then step down the page collecting frames until the end,
+/// and join them. Returns the tall picture and how many frames went into it.
+pub fn scroll_and_stitch(
+    driver: &mut dyn ScrollDriver,
+    height: u32,
+    max_frames: u32,
+    scroll_amount: i32,
+    delay_ms: u64,
+    on_progress: Option<&dyn Fn(u32, u32)>,
+    should_stop: Option<&dyn Fn() -> bool>,
+) -> anyhow::Result<(RgbaImage, usize)> {
     let stop_requested = || should_stop.map(|f| f()).unwrap_or(false);
-    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| {
-        anyhow::anyhow!(
-            "Scrolling capture needs permission to control the mouse wheel ({e}). \
-             On macOS allow SnapPro under Privacy & Security > Accessibility; \
-             on Linux allow remote interaction when the desktop asks."
-        )
-    })?;
     let max_frames = max_frames.clamp(2, 120);
     let settle = Duration::from_millis(delay_ms.max(150));
 
-    let centre_x = x + (width as i32 / 2).max(1);
-    let centre_y = y + (height as i32 / 2).max(1);
-    let park = |engine: &mut Enigo| {
-        let _ = engine.move_mouse(centre_x, centre_y, enigo::Coordinate::Abs);
-    };
-    park(&mut enigo);
+    driver.park();
 
     // Go to the top of the page: keep scrolling up until two frames match.
-    let mut last = crate::capture::full::capture_region_raw(x, y, width, height)?;
+    let mut last = driver.frame()?;
     for _ in 0..80 {
         if stop_requested() {
             break;
         }
-        let _ = enigo.scroll(-12, Axis::Vertical);
-        sleep(Duration::from_millis(60));
-        let now = crate::capture::full::capture_region_raw(x, y, width, height)?;
+        driver.scroll(-12);
+        sleep(driver.quick_settle());
+        let now = driver.frame()?;
         let same = frames_identical(&last, &now);
         last = now;
         if same {
@@ -325,7 +428,7 @@ pub fn capture_scrolling(
     }
     sleep(settle);
 
-    let first = crate::capture::full::capture_region_raw(x, y, width, height)?;
+    let first = driver.frame()?;
     let mut frames: Vec<RgbaImage> = vec![first];
     let mut shifts: Vec<Option<u32>> = Vec::new();
     if let Some(cb) = on_progress {
@@ -349,10 +452,10 @@ pub fn capture_scrolling(
         if stop_requested() {
             break;
         }
-        park(&mut enigo);
-        let _ = enigo.scroll(notches, Axis::Vertical);
+        driver.park();
+        driver.scroll(notches);
         sleep(settle);
-        let frame = crate::capture::full::capture_region_raw(x, y, width, height)?;
+        let frame = driver.frame()?;
         let prev = frames.last().expect("at least one frame");
 
         if frames_identical(prev, &frame) {
@@ -385,7 +488,7 @@ pub fn capture_scrolling(
                 // The step was too big to find any common content: go back and
                 // try a smaller one, as long as that is still possible.
                 if notches > 1 && retries < 4 {
-                    let _ = enigo.scroll(-notches, Axis::Vertical);
+                    driver.scroll(-notches);
                     sleep(settle);
                     notches = (notches / 2).max(1);
                     retries += 1;
@@ -410,12 +513,5 @@ pub fn capture_scrolling(
     } else {
         stitch_with_shifts(&frames, &shifts, footer)
     };
-    crate::capture::full::save_rgba(
-        stitched,
-        "Scrolling",
-        format,
-        dir,
-        "scrolling",
-        format!("{} frames stitched", count),
-    )
+    Ok((stitched, count))
 }

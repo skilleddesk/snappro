@@ -926,3 +926,116 @@ fn wayland_recording_reads_the_picture_from_stdin() {
     assert!(gst.contains("pipewiresrc fd=3 path=42"), "{gst}");
     assert!(gst.contains("framerate=30/1") && gst.contains("y4menc"), "{gst}");
 }
+
+/// A page taller than the window, scrolled by a fake mouse wheel.
+struct FakePage {
+    page: RgbaImage,
+    view: u32,
+    top: u32,
+    px_per_notch: u32,
+}
+
+impl snappro_lib::capture::scrolling::ScrollDriver for FakePage {
+    fn frame(&mut self) -> anyhow::Result<RgbaImage> {
+        Ok(image::imageops::crop_imm(&self.page, 0, self.top, self.page.width(), self.view).to_image())
+    }
+    fn park(&mut self) {}
+    fn scroll(&mut self, notches: i32) {
+        let max = (self.page.height() - self.view) as i64;
+        let next = self.top as i64 + notches as i64 * self.px_per_notch as i64;
+        self.top = next.clamp(0, max) as u32;
+    }
+}
+
+fn textured_page(width: u32, height: u32) -> RgbaImage {
+    let mut page = RgbaImage::new(width, height);
+    for (x, y, p) in page.enumerate_pixels_mut() {
+        // Rows differ from each other and columns vary, like lines of text.
+        let v = ((y * 37 + (x / 7) * 11 + (y / 5) * 3) % 251) as u8;
+        *p = Rgba([v, v.wrapping_mul(3), 255 - v, 255]);
+    }
+    page
+}
+
+#[test]
+fn scrolling_capture_rebuilds_the_whole_page() {
+    use snappro_lib::capture::scrolling::scroll_and_stitch;
+    let page = textured_page(160, 1000);
+    // Starts in the middle: the capture must first go back to the top.
+    let mut fake = FakePage { page: page.clone(), view: 200, top: 400, px_per_notch: 40 };
+    let (stitched, frames) = scroll_and_stitch(&mut fake, 200, 60, 0, 0, None, None).unwrap();
+    assert!(frames >= 5, "only {frames} frames");
+    assert_eq!(stitched.dimensions(), page.dimensions(), "the stitched picture must be the whole page");
+    assert_eq!(stitched.as_raw(), page.as_raw(), "the stitched picture must match the page exactly");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn png_stream_is_split_into_frames() {
+    use snappro_lib::capture::wayland_scroll::take_pngs;
+    let mut one = Vec::new();
+    solid(3, 2, [1, 2, 3, 255])
+        .write_to(&mut std::io::Cursor::new(&mut one), image::ImageFormat::Png)
+        .unwrap();
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&one);
+    stream.extend_from_slice(&one);
+    stream.extend_from_slice(&one[..10]); // the start of a third frame
+    let frames = take_pngs(&mut stream);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0], one);
+    assert_eq!(stream, one[..10].to_vec(), "the unfinished frame stays buffered");
+    stream.extend_from_slice(&one[10..]);
+    assert_eq!(take_pngs(&mut stream).len(), 1);
+    assert!(stream.is_empty());
+    let args = snappro_lib::capture::wayland_scroll::gst_args(7).join(" ");
+    assert!(args.contains("pipewiresrc fd=3 path=7") && args.contains("pngenc"), "{args}");
+}
+
+/// Lines that look alike and differ only in a small "number" (tables, lists, code).
+fn repetitive_page(width: u32, height: u32) -> RgbaImage {
+    let mut page = solid(width, height, [255, 255, 255, 255]);
+    let line = 42;
+    for y in 0..height {
+        let n = y / line;
+        let inside = y % line;
+        if !(10..24).contains(&inside) {
+            continue;
+        }
+        for x in 20..width - 40 {
+            // The same "text" on every line...
+            let ink = (x * 13 + inside * 7) % 9 < 4;
+            // ...except a few digits at the end that encode the line number.
+            let digit = x >= width - 90 && ((x / 6 + n * 5 + inside) % 4 == 0);
+            if ink || digit {
+                page.put_pixel(x, y, Rgba([30, 60, 140, 255]));
+            }
+        }
+    }
+    page
+}
+
+#[test]
+fn scrolling_capture_handles_lookalike_lines() {
+    use snappro_lib::capture::scrolling::scroll_and_stitch;
+    let page = repetitive_page(400, 2000);
+    let mut fake = FakePage { page: page.clone(), view: 300, top: 0, px_per_notch: 83 };
+    let (stitched, _) = scroll_and_stitch(&mut fake, 300, 60, 0, 0, None, None).unwrap();
+    assert_eq!(stitched.dimensions(), page.dimensions());
+    assert_eq!(stitched.as_raw(), page.as_raw(), "look-alike lines must not be stitched at the wrong offset");
+}
+
+#[test]
+fn scrolling_badge_keeps_clear_of_the_capture_area() {
+    use snappro_lib::commands::badge_corner;
+    let screen = (0, 0, 1366, 768);
+    // Area near the top-left: a corner on the far side (top-right, 336 px clear).
+    assert_eq!(badge_corner(screen, (120, 120, 600, 300), (310, 70)), Some((1056, 0)));
+    // Area across the whole top: a bottom corner.
+    assert_eq!(badge_corner(screen, (0, 0, 1366, 500), (310, 70)), Some((0, 698)));
+    // Area along the bottom: a top corner.
+    assert_eq!(badge_corner(screen, (0, 400, 1366, 368), (310, 70)), Some((0, 0)));
+    // The whole screen, or too close to every corner: nowhere to go.
+    assert_eq!(badge_corner(screen, (0, 0, 1366, 768), (310, 70)), None);
+    assert_eq!(badge_corner(screen, (20, 20, 1326, 728), (310, 70)), None);
+}

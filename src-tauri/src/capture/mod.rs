@@ -1,6 +1,8 @@
 pub mod full;
 pub mod region;
 pub mod scrolling;
+#[cfg(target_os = "linux")]
+pub mod wayland_scroll;
 pub mod window;
 
 use serde::{Deserialize, Serialize};
